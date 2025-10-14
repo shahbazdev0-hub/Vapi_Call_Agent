@@ -3,6 +3,7 @@
 
 const express = require('express');
 const { v4: uuidv4 } = require('uuid');
+const ExcelJS = require('exceljs');
 const XLSX = require('xlsx');
 const { supabase, STORAGE_BUCKETS, TABLES } = require('../config/supabase');
 const { sendEmail } = require('../utils/email');
@@ -84,97 +85,269 @@ router.get('/:orderId', async (req, res) => {
   }
 });
 
-/**
- * Simple download endpoint (creates basic Excel on-the-fly)
+**
+ * Generate Excel Report with Multiple Sheets
  * GET /api/reports/download/:orderId
  */
 router.get('/download/:orderId', async (req, res) => {
   try {
     const { orderId } = req.params;
-    console.log('📥 Creating simple download for order:', orderId);
 
-    // Get order and calls data
-    const [orderRes, callsRes] = await Promise.all([
-      supabase.from(TABLES.ORDERS).select('*').eq('id', orderId).single(),
-      supabase.from(TABLES.CALLS).select(`
-        *,
-        leads(name, phone, company, email)
-      `).eq('order_id', orderId).order('created_at', { ascending: false })
-    ]);
+    // Fetch order data
+    const { data: order, error: orderError } = await supabase
+      .from(TABLES.ORDERS)
+      .select('*')
+      .eq('id', orderId)
+      .single();
 
-    const order = orderRes.data;
-    const calls = callsRes.data || [];
-
-    if (!order) {
+    if (orderError || !order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    // Create Excel workbook
-    const XLSX = require('xlsx');
-    const workbook = XLSX.utils.book_new();
+    // Fetch all leads for this order
+    const { data: leads, error: leadsError } = await supabase
+      .from(TABLES.LEADS)
+      .select('*')
+      .eq('order_id', orderId);
 
-    // Summary sheet
-    const summaryData = [
-      ['CALL REPORT SUMMARY'],
-      ['Order ID:', orderId],
-      ['Customer:', order.customer_name],
-      ['Email:', order.customer_email],
-      ['Company:', order.company || 'N/A'],
-      ['Generated:', new Date().toLocaleString()],
-      [''],
-      ['CALL STATISTICS'],
-      ['Total Calls:', calls.length],
-      ['Completed Calls:', calls.filter(c => c.status === 'completed').length],
-      ['Failed Calls:', calls.filter(c => c.status === 'failed').length],
-      ['Success Rate:', calls.length > 0 ? 
-        Math.round((calls.filter(c => c.status === 'completed').length / calls.length) * 100) + '%' : '0%'],
-      ['Calls with Transcripts:', calls.filter(c => c.transcript && c.transcript.length > 10).length]
-    ];
-
-    const summarySheet = XLSX.utils.aoa_to_sheet(summaryData);
-    XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
-
-    // Calls detail sheet
-    if (calls.length > 0) {
-      const callHeaders = [
-        'Lead Name', 'Phone', 'Company', 'Email', 'Status', 
-        'Duration (s)', 'Date', 'Has Transcript', 'Transcript Preview'
-      ];
-      
-      const callData = calls.map(call => [
-        call.leads?.name || 'Unknown',
-        call.phone_number || 'N/A',
-        call.leads?.company || 'Unknown',
-        call.leads?.email || 'N/A',
-        call.status || 'unknown',
-        call.duration || 0,
-        new Date(call.created_at).toLocaleString(),
-        call.transcript && call.transcript.length > 10 ? 'Yes' : 'No',
-        call.transcript ? call.transcript.substring(0, 100) + '...' : 'No transcript'
-      ]);
-
-      const callSheet = XLSX.utils.aoa_to_sheet([callHeaders, ...callData]);
-      XLSX.utils.book_append_sheet(workbook, callSheet, 'Call Details');
-    } else {
-      // Empty calls sheet
-      const emptyHeaders = ['Lead Name', 'Phone', 'Company', 'Status', 'Duration', 'Date'];
-      const emptyData = [['No calls found', '', '', '', '', '']];
-      const emptySheet = XLSX.utils.aoa_to_sheet([emptyHeaders, ...emptyData]);
-      XLSX.utils.book_append_sheet(workbook, emptySheet, 'Call Details');
+    if (leadsError) {
+      console.error('Error fetching leads:', leadsError);
+      return res.status(500).json({ error: 'Failed to fetch leads' });
     }
 
-    // Generate buffer
-    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    // Fetch all calls for this order
+    const { data: calls, error: callsError } = await supabase
+      .from(TABLES.CALLS)
+      .select(`
+        *,
+        leads (*)
+      `)
+      .eq('order_id', orderId);
 
-    // Set response headers
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="call_report_${orderId}.xlsx"`);
+    if (callsError) {
+      console.error('Error fetching calls:', callsError);
+    }
+
+    // Create a map of lead_id to call data
+    const callMap = {};
+    if (calls && calls.length > 0) {
+      calls.forEach(call => {
+        callMap[call.lead_id] = call;
+      });
+    }
+
+    // Categorize leads
+    const mainList = [];
+    const priority = []; // high-pickup: people who picked up the phone
+    const verifiedContact = []; // people who picked up + said their name in voicemail
+    const dnc = []; // bad numbers/dead lines
+    const standard = []; // everyone not in other 3 categories
+
+    leads.forEach(lead => {
+      const call = callMap[lead.id];
+      
+      const leadData = {
+        number: lead.phone,
+        name: lead.name,
+        business: lead.company,
+        mobileType: '',
+        phoneCompany: '',
+        phoneLocation: '',
+        highPickup: '',
+        fakeNumber: '',
+        verifiedContact: ''
+      };
+
+      mainList.push(leadData);
+
+      if (call) {
+        // DNC: failed calls (bad numbers/dead lines)
+        if (call.status === 'failed' || call.status === 'no-answer' || call.status === 'busy') {
+          dnc.push(leadData);
+        }
+        // Priority: completed calls (people who picked up)
+        else if (call.status === 'completed' && call.duration && parseInt(call.duration) > 0) {
+          leadData.highPickup = 'Yes';
+          priority.push(leadData);
+
+          // Verified Contact: completed calls with transcript containing name
+          if (call.transcript && call.transcript.toLowerCase().includes(lead.name.toLowerCase())) {
+            leadData.verifiedContact = 'Yes';
+            verifiedContact.push(leadData);
+          }
+        }
+      }
+    });
+
+    // Standard: everyone not in other 3 categories
+    leads.forEach(lead => {
+      const call = callMap[lead.id];
+      const isInPriority = priority.some(p => p.number === lead.phone);
+      const isInVerified = verifiedContact.some(v => v.number === lead.phone);
+      const isInDNC = dnc.some(d => d.number === lead.phone);
+
+      if (!isInPriority && !isInVerified && !isInDNC) {
+        standard.push({
+          number: lead.phone,
+          name: lead.name,
+          business: lead.company,
+          mobileType: '',
+          phoneCompany: '',
+          phoneLocation: '',
+          highPickup: '',
+          fakeNumber: '',
+          verifiedContact: ''
+        });
+      }
+    });
+
+    // Create Excel workbook
+    const workbook = new ExcelJS.Workbook();
+
+    // 1. YIELD SHEET
+    const yieldSheet = workbook.addWorksheet('Yield');
     
-    // Send the file
-    res.send(buffer);
+    // Set column widths
+    yieldSheet.getColumn('B').width = 25;
+    yieldSheet.getColumn('C').width = 10;
+    yieldSheet.getColumn('D').width = 10;
+    yieldSheet.getColumn('E').width = 60;
+
+    // Add headers
+    yieldSheet.getCell('C1').value = '#';
+    yieldSheet.getCell('D1').value = '%';
+    
+    // Add data rows
+    const totalLeads = mainList.length;
+    
+    yieldSheet.getCell('B2').value = 'Main List';
+    yieldSheet.getCell('C2').value = totalLeads;
+    yieldSheet.getCell('D2').value = '100%';
+    
+    yieldSheet.getCell('B3').value = 'Priority (high-pickup)';
+    yieldSheet.getCell('C3').value = priority.length;
+    yieldSheet.getCell('D3').value = totalLeads > 0 ? ((priority.length / totalLeads) * 100).toFixed(1) + '%' : '0%';
+    yieldSheet.getCell('E3').value = 'people who picked up the phone';
+    
+    yieldSheet.getCell('B4').value = 'Verified Contact';
+    yieldSheet.getCell('C4').value = verifiedContact.length;
+    yieldSheet.getCell('D4').value = totalLeads > 0 ? ((verifiedContact.length / totalLeads) * 100).toFixed(1) + '%' : '0%';
+    yieldSheet.getCell('E4').value = 'people who picked up the phone + people who said their name in the voicemail';
+    
+    yieldSheet.getCell('B5').value = 'DNC';
+    yieldSheet.getCell('C5').value = dnc.length;
+    yieldSheet.getCell('D5').value = totalLeads > 0 ? ((dnc.length / totalLeads) * 100).toFixed(1) + '%' : '0%';
+    yieldSheet.getCell('E5').value = 'bad numbers/dead lines';
+    
+    yieldSheet.getCell('B6').value = 'Standard';
+    yieldSheet.getCell('C6').value = standard.length;
+    yieldSheet.getCell('D6').value = totalLeads > 0 ? ((standard.length / totalLeads) * 100).toFixed(1) + '%' : '0%';
+    yieldSheet.getCell('E6').value = 'everyone not in the other 3 categories';
+
+    // Style the Yield sheet
+    ['C1', 'D1'].forEach(cell => {
+      yieldSheet.getCell(cell).font = { bold: true };
+      yieldSheet.getCell(cell).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFD9D9D9' }
+      };
+    });
+
+    ['B2', 'B3', 'B4', 'B5', 'B6'].forEach(cell => {
+      yieldSheet.getCell(cell).font = { bold: true };
+    });
+
+    // Highlight rows with color
+    ['C2', 'D2', 'E2'].forEach(cell => {
+      yieldSheet.getCell(cell).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFFDE9D9' }
+      };
+    });
+
+    ['C3', 'D3', 'E3', 'C4', 'D4', 'E4', 'C5', 'D5', 'E5', 'C6', 'D6', 'E6'].forEach(cell => {
+      yieldSheet.getCell(cell).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFFDE9D9' }
+      };
+    });
+
+    // 2. MAIN LIST SHEET
+    const mainListSheet = workbook.addWorksheet('Main List');
+    mainListSheet.columns = [
+      { header: 'Number', key: 'number', width: 15 },
+      { header: 'Name', key: 'name', width: 20 },
+      { header: 'Business', key: 'business', width: 25 },
+      { header: 'Mobile Type', key: 'mobileType', width: 15 },
+      { header: 'Phone Company', key: 'phoneCompany', width: 20 },
+      { header: 'Phone Location', key: 'phoneLocation', width: 20 },
+      { header: 'High Pickup', key: 'highPickup', width: 12 },
+      { header: 'Fake (invalid) Number', key: 'fakeNumber', width: 20 },
+      { header: 'Verified Contact', key: 'verifiedContact', width: 18 }
+    ];
+    mainList.forEach(lead => mainListSheet.addRow(lead));
+
+    // 3. PRIORITY SHEET
+    const prioritySheet = workbook.addWorksheet('Priority');
+    prioritySheet.columns = [
+      { header: 'Number', key: 'number', width: 15 },
+      { header: 'Name', key: 'name', width: 20 },
+      { header: 'Business', key: 'business', width: 25 },
+      { header: 'Mobile Type', key: 'mobileType', width: 15 },
+      { header: 'Phone Company', key: 'phoneCompany', width: 20 },
+      { header: 'Phone Location', key: 'phoneLocation', width: 20 },
+      { header: 'Fake (invalid) Number', key: 'fakeNumber', width: 20 },
+      { header: 'Verified Contact', key: 'verifiedContact', width: 18 },
+      { header: 'High Pickup', key: 'highPickup', width: 12 }
+    ];
+    priority.forEach(lead => prioritySheet.addRow(lead));
+
+    // 4. VERIFIED CONTACT SHEET
+    const verifiedSheet = workbook.addWorksheet('Verified Contact');
+    verifiedSheet.columns = [
+      { header: 'Number', key: 'number', width: 15 },
+      { header: 'Name', key: 'name', width: 20 },
+      { header: 'Business', key: 'business', width: 25 },
+      { header: 'Mobile Type', key: 'mobileType', width: 15 },
+      { header: 'Phone Company', key: 'phoneCompany', width: 20 },
+      { header: 'Phone Location', key: 'phoneLocation', width: 20 },
+      { header: 'Fake (invalid) Number', key: 'fakeNumber', width: 20 },
+      { header: 'Verified Contact', key: 'verifiedContact', width: 18 },
+      { header: 'High Pickup', key: 'highPickup', width: 12 }
+    ];
+    verifiedContact.forEach(lead => verifiedSheet.addRow(lead));
+
+    // 5. DNC SHEET
+    const dncSheet = workbook.addWorksheet('DNC');
+    dncSheet.columns = [
+      { header: 'Number', key: 'number', width: 15 },
+      { header: 'Name', key: 'name', width: 20 },
+      { header: 'Business', key: 'business', width: 25 }
+    ];
+    dnc.forEach(lead => dncSheet.addRow(lead));
+
+    // Style all sheet headers
+    [mainListSheet, prioritySheet, verifiedSheet, dncSheet].forEach(sheet => {
+      sheet.getRow(1).font = { bold: true };
+      sheet.getRow(1).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFD9D9D9' }
+      };
+    });
+
+    // Generate Excel file
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=Order_Report_${orderId}_${new Date().toISOString().split('T')[0]}.xlsx`);
+
+    await workbook.xlsx.write(res);
+    res.end();
 
   } catch (error) {
-    console.error('Simple download error:', error);
+    console.error('Error generating report:', error);
     res.status(500).json({
       error: 'Failed to generate report',
       message: error.message

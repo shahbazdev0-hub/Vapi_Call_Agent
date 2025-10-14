@@ -8,6 +8,7 @@ const orderRoutes = require('./routes/orders');
 const uploadRoutes = require('./routes/upload');
 const callRoutes = require('./routes/calls');
 const reportRoutes = require('./routes/reports');
+const reportsRouter = require('./routes/reports');
 const dashboardRoutes = require('./routes/dashboard');
 const webhookRoutes = require('./routes/webhooks'); // Add webhook routes
 const stripeWebhookRoutes = require('./routes/stripe-webhooks');
@@ -56,6 +57,7 @@ app.use('/api/orders', orderRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/reports', reportsRouter);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/webhooks', webhookRoutes); // Add webhook routes
 // const stripeWebhookRoutes = require('./routes/stripe-webhooks');
